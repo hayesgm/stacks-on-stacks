@@ -1,0 +1,207 @@
+#!/usr/bin/env ruby
+
+require 'json'
+require 'net/ssh'
+require 'open3'
+require 'pp'
+
+puts "\033];Stack\007"
+puts "Welcome to Stacks on Stacks"
+
+class Stack
+  module Commands
+    def self.run(serverish, *cmds)
+      env, address = get_serverish(serverish)
+
+      cmd = cmds.join(' ')
+      
+      run_with_output(address, cmd)
+    end
+
+    def self.tail(serverish, log_file)
+      env, address = get_serverish(serverish)
+      
+      default = "#{env}.log"
+      log_file = "/srv/www/shadow/shared/log/#{logfile || default}"
+      cmd = "sudo tail -f #{log_file}"
+
+      ssh = get_ssh(env, address, cmd)
+      
+      stdin, @stdin = IO.pipe
+      @stdout, stdout = IO.pipe
+      @stderr, stderr = IO.pipe
+      puts "Running #{ssh}"
+
+      puts "\033];#{ARGV[1]} [tail]\007"
+      Open3.pipeline ssh
+    end
+
+    def self.list(env)
+      
+      get_instances(env).each do |instance|
+        puts "Server - #{instance['PublicDnsName']}"
+        instance['Tags'].each do |tag|
+          puts "\t#{tag['Key']}: #{tag['Value']}"
+        end
+      end
+
+    end
+
+    def self.ssh(serverish)
+      env, address = get_serverish(serverish)
+      ssh = get_ssh(env, address)
+
+      stdin, @stdin = IO.pipe
+      @stdout, stdout = IO.pipe
+      @stderr, stderr = IO.pipe
+      puts "Running #{ssh}"
+
+      puts "\033];#{serverish} [ssh]\007"
+      Open3.pipeline ssh
+    end
+
+    def self.console(serverish)
+      env, address = get_serverish(serverish)
+
+      cmd = "sudo su deploy -c \\\"cd /srv/www/shadow/current && RAILS_ENV=#{env} bundle exec rails console\\\""
+
+      ssh = get_ssh(env, address, cmd)
+
+      stdin, @stdin = IO.pipe
+      @stdout, stdout = IO.pipe
+      @stderr, stderr = IO.pipe
+      puts "Running #{ssh}"
+
+      puts "\033];#{serverish} [console]\007"
+      Open3.pipeline ssh
+    end
+
+    def self.db(serverish)
+      env, address = get_serverish(serverish)
+
+      cmd = "sudo su deploy -c \\\"cd /srv/www/shadow/current && RAILS_ENV=#{env} bundle exec rails db -p\\\""
+
+      ssh = get_ssh(env, address, cmd)
+
+      stdin, @stdin = IO.pipe
+      @stdout, stdout = IO.pipe
+      @stderr, stderr = IO.pipe
+      puts "Running #{ssh}"
+
+      puts "\033];#{ARGV[1]} [console]\007"
+      Open3.pipeline ssh
+    end
+  end
+end
+  
+def error(message)
+  raise "Error: #{message}"
+  exit 1
+end
+
+# TODO: Should we use a cache here or pull this live?
+# We're probably going to want to persist settings into where this is being called
+def describe
+  # File.read("#{File.dirname(__FILE__)}/.server-cache") || `aws ec2 describe-instances`
+  cmd = "aws ec2 describe-instances"
+  if !ENV['PROFILE'].nil?
+    cmd << " --profile #{ENV['PROFILE']}"
+  end
+
+  `#{cmd}`
+end
+
+# Takes an <serverish> and returns an instance
+def get_serverish(name)
+  # We're going to take a few options here
+
+  case
+  when matchData = /(?<env>[\w-]+):(?<name>\w+)/.match(name)
+    env, name = matchData[:env], matchData[:name]
+    inst = get_instance(env, name)
+    "Unable to find server: #{env}:#{name}" if inst.nil?
+    return env, get_internal_address(inst)
+  when matchData = /(?<env>[\w-]+)::(?<type>[\w.]+)/.match(name) # Looks like a name
+    inst = get_instances_by_type(matchData[:env], matchData[:type],)[0]
+    pp [ 'Getting Default Instance', inst ]
+    return matchData[:env], get_internal_address(inst)
+  when matchData = /(?<env>[\w-]+):(?<name>[\w.]+)/.match(name) # Looks like a name
+    return matchData[:env], matchData[:name]
+  else # Default env server
+    env = name
+    inst = get_instances_by_type(env,'worker')[0]
+    pp [ 'Getting Default Instance', inst ]
+    return env, get_internal_address(inst)
+  end
+end
+
+def get_instances(env=nil)
+  servers = JSON(describe)
+  reservations = servers['Reservations']
+  instances = reservations.map { |reservation| reservation['Instances'].first }
+  return instances if env.nil?
+  instances.select { |instance| tag = instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }.first rescue nil; tag && tag['Value'] == env }
+end
+
+def get_instance(env, name)
+  pp ['Getting instance', env, name]
+  inst = get_instances.select { |instance| instance['Tags'].select { |t| t['Key'] == "Name" }[0]['Value'] == "#{env} - #{name}" rescue false }.first
+  error("Unable to find instance #{env}, #{name}") if inst.nil?
+  inst
+end
+
+def get_instances_by_type(env, type)
+  pp ['Getting instances',env,type]
+  get_instances.select { |instance| instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }[0]['Value'] == "#{env}" && instance['Tags'].select { |t| t['Key'] == "opsworks:layer:#{type}" }.count > 0 rescue false }
+end
+
+def get_address(instance)
+  instance['PublicDnsName']
+end
+
+def get_ssh(env, address, cmd=nil)
+  "ssh -t #{bastion(env)} 'ssh -t #{address}#{cmd ? " \"#{cmd}\"" : nil}'"
+end
+
+def get_internal_address(instance)
+  instance['PrivateDnsName']
+end
+
+def bastion(env)
+  get_address(get_instance(env, 'bastion'))
+end
+
+def run_with_output(env, address, cmd)
+  cmd = get_ssh(env, address, cmd)
+  puts "Running #{get_ssh(env, address, cmd)}"
+
+  Net::SSH.start(address) do |ssh|
+    ssh.exec!("sudo #{cmd}") do |channel, stream, data|
+      STDOUT << data if stream == :stdout
+    end
+  end
+end
+
+if ARGV[0].nil? || ARGV[0] == ""
+  puts ""
+  puts "usage: stack {run,tail,list,ssh,console}"
+  puts "\t <serverish>: {env, env:name, env::type, env:ip-address}"
+  puts "\t e.g."
+  puts "\t stack list <env>"
+  puts "\t stack tail <serverish> [something.log]"
+  puts "\t stack run <serverish> cat /srv/www/shadow/shared/log/staging.log"
+  puts "\t stack ssh <serverish>"
+  puts "\t stack console <serverish>"
+  exit
+end
+
+if Stack::Commands.respond_to?(ARGV[0])
+  # TODO: Check method signature and print disparties
+  Stack::Commands.send(ARGV[0], *ARGV[1,])
+  puts "Ending Stacks on Stacks Session"
+else
+  raise "Unknown command: #{ARGV[0]}"
+end
+
+puts "Stacks on Stacks Finished"
+puts "\033];bash\007"
