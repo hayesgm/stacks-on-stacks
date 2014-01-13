@@ -39,7 +39,7 @@ class Stack
     def self.list(env)
       
       get_instances(env).each do |instance|
-        puts "Server - #{instance['PublicDnsName']}"
+        puts "Server - #{instance['PublicDnsName'] || instance['PublicIp']}"
         instance['Tags'].each do |tag|
           puts "\t#{tag['Key']}: #{tag['Value']}"
         end
@@ -113,19 +113,19 @@ end
 
 # Takes an <serverish> and returns an instance
 def get_serverish(name)
-  # We're going to take a few options here
 
+  # We're going to take a few options here
   case
-  when matchData = /(?<env>[\w-]+):(?<name>\w+)/.match(name)
+  when matchData = /(?<env>[\w-]+):(?<name>[\w-]+)/.match(name)
     env, name = matchData[:env], matchData[:name]
     inst = get_instance(env, name)
     "Unable to find server: #{env}:#{name}" if inst.nil?
     return env, get_internal_address(inst)
-  when matchData = /(?<env>[\w-]+)::(?<type>[\w.]+)/.match(name) # Looks like a name
+  when matchData = /(?<env>[\w-]+)::(?<type>[\w.-]+)/.match(name) # Looks like a name
     inst = get_instances_by_type(matchData[:env], matchData[:type],)[0]
     pp [ 'Getting Default Instance', inst ]
     return matchData[:env], get_internal_address(inst)
-  when matchData = /(?<env>[\w-]+):(?<name>[\w.]+)/.match(name) # Looks like a name
+  when matchData = /(?<env>[\w-]+):(?<name>[\w.-]+)/.match(name) # Looks like a name
     return matchData[:env], matchData[:name]
   else # Default env server
     env = name
@@ -133,6 +133,7 @@ def get_serverish(name)
     pp [ 'Getting Default Instance', inst ]
     return env, get_internal_address(inst)
   end
+
 end
 
 def get_instances(env=nil)
@@ -156,15 +157,28 @@ def get_instances_by_type(env, type)
 end
 
 def get_address(instance)
-  instance['PublicDnsName']
+  instance['PublicDnsName'] || instance['PublicIpAddress']
 end
 
 def get_ssh(env, address, cmd=nil)
-  "ssh -t #{bastion(env)} 'ssh -t #{address}#{cmd ? " \"#{cmd}\"" : nil}'"
+  bastion = bastion(env)
+  if ENV['USER']
+    bastion = "#{ENV['USER']}@#{bastion}"
+  end
+
+  base = ['ssh', '-t', bastion]
+  
+  if ENV['IDENTITY']
+    base.concat ['-i', ENV['IDENTITY']]
+  end
+
+  base << '"' + ['ssh', '-t', address, cmd ? "\"#{cmd}\"" : nil].join(' ') + '"'
+  
+  base.join(' ')
 end
 
 def get_internal_address(instance)
-  instance['PrivateDnsName']
+  instance['PrivateIpAddress'] || instance['PrivateDnsName']
 end
 
 def bastion(env)
