@@ -254,6 +254,18 @@ class Stack
 
       Stack::Helpers.open3(ssh, "#{serverish} [db-console]")
     end
+
+    def self.rake(serverish, rake_task, *args)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      app_env = Stack::Helpers.config(:env) || env
+      app = Stack::Helpers.config(:app)
+
+      cmd = "sudo su deploy -c \\\"cd /srv/www/#{app}/current && RAILS_ENV=#{app_env} bundle exec rake #{rake_task} [#{args.join(',')}] -p\\\""
+
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
+
+      Stack::Helpers.open3(ssh, "#{serverish} [rake] (rake #{rake_task} [#{args.join(',')}])")
+    end
   end
 end
 
@@ -271,6 +283,8 @@ if ARGV[0].nil? || ARGV[0] == ""
   puts "\t stack run <serverish> cat /srv/www/app/shared/log/production.log"
   puts "\t stack ssh <serverish>"
   puts "\t stack console <serverish>"
+  puts "\t stack db <serverish>"
+  puts "\t stack rake <serverish> <namespace>:<rake_task>"
   puts "\t stack configure --key=val --key2=val2"
   puts "\t"
   puts "\t config variables: { app: '<app name> for /srv/www/<app>/current directory', profile: 'aws profile in ~/.aws/config', identity: 'e.g. ~/.ssh/id_rsa', ssh_user: 'geoff for ssh geoff@<host>', bastion: 'layer type as a bastion server' }"
