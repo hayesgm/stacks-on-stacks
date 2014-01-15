@@ -259,8 +259,11 @@ class Stack
       env, address = Stack::Helpers.get_serverish(serverish)
       app_env = Stack::Helpers.config(:env) || env
       app = Stack::Helpers.config(:app)
+      # accepts either type of args, e.g. task:run[1,2,3] or task:run 1 2 3
+      # should fail if both given
+      arg_string = args.count > 0 ? "[#{args.join(',')}]" : ""
 
-      cmd = "sudo su deploy -c \\\"cd /srv/www/#{app}/current && RAILS_ENV=#{app_env} bundle exec rake #{rake_task} [#{args.join(',')}] -p\\\""
+      cmd = "sudo su deploy -c \\\"cd /srv/www/#{app}/current && RAILS_ENV=#{app_env} bundle exec rake #{rake_task}#{arg_string}\\\""
 
       ssh = Stack::Helpers.get_ssh(env, address, cmd)
 
