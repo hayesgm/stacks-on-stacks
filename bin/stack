@@ -1,10 +1,12 @@
 #!/usr/bin/env ruby
 
+require 'rubygems'
 require 'json'
-require 'net/ssh'
 require 'open3'
 require 'pp'
 require 'securerandom'
+require 'aws-sdk'
+require 'inifile'
 
 class Stack
   module Helpers
@@ -170,6 +172,36 @@ class Stack
       return res, opts
     end
 
+    def self.wait_on_aws_deployment(deployment)
+      deployment_id = deployment.data[:deployment_id]
+      deployment_desc = nil
+
+      while true
+        deployment_desc = AWS.ops_works.client.describe_deployments(deployment_ids: [deployment_id])
+        
+        status = deployment_desc.data[:deployments].first[:status]
+
+        case status
+        when 'running'
+          sleep 10
+        when 'successful'
+          return true
+        else
+          raise "Failed to run deployment: #{deployment_id} - #{status}"
+        end
+      end
+
+      return true if deployment_desc.data[:status] == 'successful'
+    end
+
+    def self.doc(opts)
+      @@docs ||= {}
+      @@docs.merge!(opts)
+    end
+
+    def self.docs(method)
+      (@@docs || {})[method.to_sym]
+    end
   end
 
   module Commands
@@ -283,6 +315,56 @@ class Stack
 
       Stack::Helpers.open3(ssh, "#{serverish} [rake] (rake #{rake_task} [#{args.join(',')}])")
     end
+
+    Stack::Helpers.doc deploy: {
+      arguments: [
+        { name: :stack_id, desc: "Id of stack" },
+        { name: :app_id, desc: "Id of app" },
+        { name: :wait, desc: "Wait for deployment to complete?", default: true }
+        # { name: :branch, desc: "Branch for deploy" }
+      ]
+    }
+    def self.deploy(stack_id, app_id, wait="true")
+      # First, try to pull these from the environment
+      iam_key = Stack::Helpers.config(:iam_key)
+      iam_secret = Stack::Helpers.config(:iam_secret)
+      region = Stack::Helpers.config(:region)
+
+      # Otherwise, we'll pull them from config
+      if ( iam_key.nil? || iam_secret.nil? || region.nil? ) && Stack::Helpers.config(:aws_config_file)
+        aws_config = IniFile.load(Stack::Helpers.config(:aws_config_file))
+        profile = Stack::Helpers.config(:profile) ? "profile #{Stack::Helpers.config(:profile)}" : "default"
+
+        pp ['Stack', 'Using aws config', Stack::Helpers.config(:aws_config_file), profile]
+
+        conf = aws_config[profile]
+
+        iam_key = conf['aws_access_key_id']
+        iam_secret = conf['aws_secret_access_key']
+        region = conf['region']
+      end
+
+      raise ArgumentError, "Must set IAM_KEY environment variable" if iam_key.nil? || iam_key.length == 0
+      raise ArgumentError, "Must set IAM_SECRET environment variable" if iam_secret.nil? || iam_secret.length == 0
+      raise ArgumentError, "Must set REGION environment variable" if region.nil? || region.length == 0
+
+      AWS.config({
+        access_key_id: iam_key,
+        secret_access_key: iam_secret,
+        region: region
+      })
+
+      # We can't wait on deploy since it seems to timeout Bugsnag :-\
+      # deployment = AWS.ops_works.client.create_deployment(stack_id: stack_id, app_id: app_id, command: {name: 'deploy'})
+      
+      if wait && wait[0] == "t"
+        #Stack::Helpers.wait_on_aws_deployment(deployment)
+      end
+
+      # TODO: Wait on deploy?
+      # TODO: Revision management
+      # revision = `git fetch && git rev-parse origin/#{stack[:branch]}` rescue nil
+    end
   end
 end
 
@@ -316,7 +398,18 @@ Stack::Helpers.load_config!(opts)
 # pp ['Stack',args,opts]
 
 if Stack::Commands.respond_to?(args[0])
-  Stack::Commands.send(args.shift, *args)
+  method = args.shift
+
+  begin
+    Stack::Commands.send(method, *args)
+  rescue ArgumentError => e
+    if Stack::Helpers.docs(method)
+      puts "Usage: stack #{method} #{Stack::Helpers.docs(method).inspect}"
+    else
+      raise e
+    end
+  end
+
   puts "Ending Stacks on Stacks Session"
 else
   raise "Unknown command: #{args[0]}"
