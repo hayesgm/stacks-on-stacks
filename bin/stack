@@ -4,6 +4,7 @@ require 'json'
 require 'net/ssh'
 require 'open3'
 require 'pp'
+require 'securerandom'
 
 class Stack
   module Helpers
@@ -98,7 +99,7 @@ class Stack
     def self.get_ssh(env, address, cmd=nil)
       bastion = bastion(env)
 
-      if config(:user)
+      if config(:ssh_user)
         bastion = "#{config(:ssh_user)}@#{bastion}"
       end
 
@@ -151,9 +152,9 @@ class Stack
         arg = args.shift
 
         case
-        when arg =~ /^[-]{1,2}([\w_-]+)=([^ ]*)$/i
+        when arg =~ /^[-]{2,2}([\w_-]+)=([^ ]*)$/i
           key, val = $1, $2
-        when arg =~ /^[-]{1,2}([\w_-]+)+$/i
+        when arg =~ /^[-]{2,2}([\w_-]+)+$/i
           key = $1
           val = args.shift
         else
@@ -191,12 +192,25 @@ class Stack
     def self.run(serverish, *cmds)
       env, address = Stack::Helpers.get_serverish(serverish)
 
-      cmd = cmds.join(' ')
-      
-      Stack::Helpers.run_with_output(address, cmd)
+      cmd = "sudo #{cmds.join(' ')}"
+
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
+
+      Stack::Helpers.open3(ssh, "#{serverish} [run `#{cmd}`]")
     end
 
-    def self.tail(serverish, log_file=nil)
+    def self.nohup(serverish, *cmds)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      
+      log_file = "/tmp/nohup-#{SecureRandom.uuid}.out"
+      cmd = "touch #{log_file} && nohup sudo #{cmds.join(' ')} > #{log_file} 2>&1& sudo tail -f #{log_file}"
+
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
+
+      Stack::Helpers.open3(ssh, "#{serverish} [run `#{cmd}`]")
+    end
+
+    def self.tail(serverish, log_file=nil, lines=150)
       env, address = Stack::Helpers.get_serverish(serverish)
       app_env = Stack::Helpers.config(:env) || env
 
@@ -206,7 +220,7 @@ class Stack
         log_file = "/srv/www/#{Stack::Helpers.config(:app)}/shared/log/#{log_file}"
       end
 
-      cmd = "sudo tail -f #{log_file}"
+      cmd = "sudo tail -n #{lines.to_i} -f #{log_file}"
 
       ssh = Stack::Helpers.get_ssh(env, address, cmd)
       
