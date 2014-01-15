@@ -5,40 +5,217 @@ require 'net/ssh'
 require 'open3'
 require 'pp'
 
-puts "\033];Stack\007"
-puts "Welcome to Stacks on Stacks"
-
 class Stack
-  module Commands
-    def self.run(serverish, *cmds)
-      env, address = get_serverish(serverish)
-
-      cmd = cmds.join(' ')
-      
-      run_with_output(address, cmd)
+  module Helpers
+    
+    def self.load_config!(opts={})
+      @@config = if File.exists?('.stack') # runs in `pwd`
+        JSON(File.read('.stack'))
+      else
+        {}
+      end.merge(opts)
     end
 
-    def self.tail(serverish, log_file)
-      env, address = get_serverish(serverish)
-      
-      default = "#{env}.log"
-      log_file = "/srv/www/shadow/shared/log/#{logfile || default}"
-      cmd = "sudo tail -f #{log_file}"
+    def self.config_hash
+      @@config
+    end
 
-      ssh = get_ssh(env, address, cmd)
+    # We'll try to pull from ENV or our config
+    def self.config(var, default=nil)
+      ENV[var.to_s.upcase] || @@config[var.to_s] || default
+    end
+
+    def self.error(message)
+      raise "Error: #{message}"
+      exit 1
+    end
+
+    # TODO: Should we use a cache here or pull this live?
+    # We're probably going to want to persist settings into where this is being called
+    def self.describe
+      # File.read("#{File.dirname(__FILE__)}/.server-cache") || `aws ec2 describe-instances`
+      cmd = "aws ec2 describe-instances"
+      if !config(:profile).nil?
+        cmd << " --profile #{config(:profile)}"
+      end
+
+      `#{cmd}`
+    end
+
+    # Takes an <serverish> and returns an instance
+    def self.get_serverish(name)
+
+      # We're going to take a few options here
+      case
+      when matchData = /(?<env>[\w-]+):(?<name>[\w-]+)/.match(name)
+        env, name = matchData[:env], matchData[:name]
+        inst = get_instance(env, name)
+        "Unable to find server: #{env}:#{name}" if inst.nil?
+        return env, get_internal_address(inst)
+      when matchData = /(?<env>[\w-]+)::(?<type>[\w.-]+)/.match(name) # Looks like a name
+        inst = get_instances_by_type(matchData[:env], matchData[:type],)[0]
+        pp [ 'Getting Default Instance', matchData[:env], matchData[:type] ]
+        return matchData[:env], get_internal_address(inst)
+      when matchData = /(?<env>[\w-]+):(?<name>[\w.-]+)/.match(name) # Looks like a name
+        return matchData[:env], matchData[:name]
+      else # Default env server
+        env = name
+        inst = get_instances_by_type(env,'worker')[0]
+        pp [ 'Getting Default Instance', inst ]
+        return env, get_internal_address(inst)
+      end
+
+    end
+
+    def self.get_instances(env=nil)
+      servers = JSON(describe)
+      reservations = servers['Reservations']
+      instances = reservations.map { |reservation| reservation['Instances'].first }
+      return instances if env.nil?
+      instances.select { |instance| tag = instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }.first rescue nil; tag && tag['Value'] == env }
+    end
+
+    def self.get_instance(env, name)
+      pp ['Getting instance', env, name]
+      inst = get_instances.select { |instance| instance['State']['Name'] != "terminated" && instance['Tags'].select { |t| t['Key'] == "Name" }[0]['Value'] == "#{env} - #{name}" rescue false }.first
+      error("Unable to find instance #{env}, #{name}") if inst.nil?
+      inst
+    end
+
+    def self.get_instances_by_type(env, type)
+      pp ['Getting instances',env,type]
+      get_instances.select do |instance|
+        instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }.first['Value'] == "#{env}" &&
+          instance['Tags'].select { |t| t['Key'] == "opsworks:layer:#{type}" }.count > 0 &&
+          instance['State']['Name'] != "terminated" rescue false
+      end
+    end
+
+    def self.get_address(instance)
+      instance['PublicDnsName'] || instance['PublicIpAddress']
+    end
+
+    def self.get_ssh(env, address, cmd=nil)
+      bastion = bastion(env)
+
+      if config(:user)
+        bastion = "#{config(:ssh_user)}@#{bastion}"
+      end
+
+      base = ['ssh', '-t', bastion]
       
+      if config(:identity)
+        base.concat ['-i', config(:identity)]
+      end
+
+      base << "'" + ['ssh', '-t', address, cmd ? "\"#{cmd}\"" : nil].join(' ') + "'"
+      
+      base.join(' ')
+    end
+
+    def self.get_internal_address(instance)
+      instance['PrivateIpAddress'] || instance['PrivateDnsName']
+    end
+
+    def self.bastion(env)
+      get_address(get_instance(env, config(:bastion,'bastion')))
+    end
+
+    def self.run_with_output(env, address, cmd)
+      cmd = get_ssh(env, address, cmd)
+      puts "Running #{get_ssh(env, address, cmd)}"
+
+      Net::SSH.start(address) do |ssh|
+        ssh.exec!("sudo #{cmd}") do |channel, stream, data|
+          STDOUT << data if stream == :stdout
+        end
+      end
+    end
+
+    def self.open3(cmd, tag=nil)
       stdin, @stdin = IO.pipe
       @stdout, stdout = IO.pipe
       @stderr, stderr = IO.pipe
-      puts "Running #{ssh}"
 
-      puts "\033];#{ARGV[1]} [tail]\007"
-      Open3.pipeline ssh
+      puts "Running #{cmd}"
+      puts "\033];#{tag}\007" if tag
+      Open3.pipeline cmd
+      puts "Stacks on Stacks Finished"
+    end
+
+    def self.parse_opts(args)
+      opts = {}
+      res = []
+
+      while args.length > 0
+        arg = args.shift
+
+        case
+        when arg =~ /^[-]{1,2}([\w_-]+)=([^ ]*)$/i
+          key, val = $1, $2
+        when arg =~ /^[-]{1,2}([\w_-]+)+$/i
+          key = $1
+          val = args.shift
+        else
+          res.push arg # add arg
+          next
+        end
+
+        key = key.gsub('-','_') # valid symbol names
+
+        opts[key] = val
+      end
+
+      return res, opts
+    end
+
+  end
+
+  module Commands
+    def self.configure(*args)
+      args, opts = Stack::Helpers.parse_opts(args)
+      if args.length > 0
+        raise "Configure doesn't take any args, got: #{args}"
+      end
+
+      opts = Stack::Helpers.config_hash.merge(opts)
+
+      opts.delete_if { |key,val| val.nil? || val == "" } # remove blank keys
+        
+      pp ['Setting Config', opts]
+
+      json = JSON.pretty_generate(opts)
+      File.open(".stack", 'w') { |file| file.write(json) }
+    end
+
+    def self.run(serverish, *cmds)
+      env, address = Stack::Helpers.get_serverish(serverish)
+
+      cmd = cmds.join(' ')
+      
+      Stack::Helpers.run_with_output(address, cmd)
+    end
+
+    def self.tail(serverish, log_file=nil)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      app_env = Stack::Helpers.config(:env) || env
+
+      log_file ||= "/srv/www/#{Stack::Helpers.config(:app)}/shared/log/#{app_env}.log"
+
+      unless log_file.include?('/')
+        log_file = "/srv/www/#{Stack::Helpers.config(:app)}/shared/log/#{log_file}"
+      end
+
+      cmd = "sudo tail -f #{log_file}"
+
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
+      
+      Stack::Helpers.open3(ssh, "#{serverish} [tail]")
     end
 
     def self.list(env)
       
-      get_instances(env).each do |instance|
+      Stack::Helpers.get_instances(env).each do |instance|
         puts "Server - #{instance['PublicDnsName'] || instance['PublicIp']}"
         instance['Tags'].each do |tag|
           puts "\t#{tag['Key']}: #{tag['Value']}"
@@ -48,153 +225,41 @@ class Stack
     end
 
     def self.ssh(serverish)
-      env, address = get_serverish(serverish)
-      ssh = get_ssh(env, address)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      ssh = Stack::Helpers.get_ssh(env, address)
 
-      stdin, @stdin = IO.pipe
-      @stdout, stdout = IO.pipe
-      @stderr, stderr = IO.pipe
-      puts "Running #{ssh}"
-
-      puts "\033];#{serverish} [ssh]\007"
-      Open3.pipeline ssh
+      Stack::Helpers.open3(ssh, "#{serverish} [ssh]")
     end
 
     def self.console(serverish)
-      env, address = get_serverish(serverish)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      app_env = Stack::Helpers.config(:env) || env
+      app = Stack::Helpers.config(:app)
 
-      cmd = "sudo su deploy -c \\\"cd /srv/www/shadow/current && RAILS_ENV=#{env} bundle exec rails console\\\""
+      cmd = "sudo su deploy -c \\\"cd /srv/www/#{app}/current && RAILS_ENV=#{app_env} bundle exec rails console\\\""
 
-      ssh = get_ssh(env, address, cmd)
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
 
-      stdin, @stdin = IO.pipe
-      @stdout, stdout = IO.pipe
-      @stderr, stderr = IO.pipe
-      puts "Running #{ssh}"
-
-      puts "\033];#{serverish} [console]\007"
-      Open3.pipeline ssh
+      Stack::Helpers.open3(ssh, "#{serverish} [console]")
     end
 
     def self.db(serverish)
-      env, address = get_serverish(serverish)
+      env, address = Stack::Helpers.get_serverish(serverish)
+      app_env = Stack::Helpers.config(:env) || env
+      app = Stack::Helpers.config(:app)
 
-      cmd = "sudo su deploy -c \\\"cd /srv/www/shadow/current && RAILS_ENV=#{env} bundle exec rails db -p\\\""
+      cmd = "sudo su deploy -c \\\"cd /srv/www/#{app}/current && RAILS_ENV=#{app_env} bundle exec rails db -p\\\""
 
-      ssh = get_ssh(env, address, cmd)
+      ssh = Stack::Helpers.get_ssh(env, address, cmd)
 
-      stdin, @stdin = IO.pipe
-      @stdout, stdout = IO.pipe
-      @stderr, stderr = IO.pipe
-      puts "Running #{ssh}"
-
-      puts "\033];#{ARGV[1]} [console]\007"
-      Open3.pipeline ssh
+      Stack::Helpers.open3(ssh, "#{serverish} [db-console]")
     end
   end
 end
-  
-def error(message)
-  raise "Error: #{message}"
-  exit 1
-end
 
-# TODO: Should we use a cache here or pull this live?
-# We're probably going to want to persist settings into where this is being called
-def describe
-  # File.read("#{File.dirname(__FILE__)}/.server-cache") || `aws ec2 describe-instances`
-  cmd = "aws ec2 describe-instances"
-  if !ENV['PROFILE'].nil?
-    cmd << " --profile #{ENV['PROFILE']}"
-  end
-
-  `#{cmd}`
-end
-
-# Takes an <serverish> and returns an instance
-def get_serverish(name)
-
-  # We're going to take a few options here
-  case
-  when matchData = /(?<env>[\w-]+):(?<name>[\w-]+)/.match(name)
-    env, name = matchData[:env], matchData[:name]
-    inst = get_instance(env, name)
-    "Unable to find server: #{env}:#{name}" if inst.nil?
-    return env, get_internal_address(inst)
-  when matchData = /(?<env>[\w-]+)::(?<type>[\w.-]+)/.match(name) # Looks like a name
-    inst = get_instances_by_type(matchData[:env], matchData[:type],)[0]
-    pp [ 'Getting Default Instance', inst ]
-    return matchData[:env], get_internal_address(inst)
-  when matchData = /(?<env>[\w-]+):(?<name>[\w.-]+)/.match(name) # Looks like a name
-    return matchData[:env], matchData[:name]
-  else # Default env server
-    env = name
-    inst = get_instances_by_type(env,'worker')[0]
-    pp [ 'Getting Default Instance', inst ]
-    return env, get_internal_address(inst)
-  end
-
-end
-
-def get_instances(env=nil)
-  servers = JSON(describe)
-  reservations = servers['Reservations']
-  instances = reservations.map { |reservation| reservation['Instances'].first }
-  return instances if env.nil?
-  instances.select { |instance| tag = instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }.first rescue nil; tag && tag['Value'] == env }
-end
-
-def get_instance(env, name)
-  pp ['Getting instance', env, name]
-  inst = get_instances.select { |instance| instance['Tags'].select { |t| t['Key'] == "Name" }[0]['Value'] == "#{env} - #{name}" rescue false }.first
-  error("Unable to find instance #{env}, #{name}") if inst.nil?
-  inst
-end
-
-def get_instances_by_type(env, type)
-  pp ['Getting instances',env,type]
-  get_instances.select { |instance| instance['Tags'].select { |t| t['Key'] == "opsworks:stack" }[0]['Value'] == "#{env}" && instance['Tags'].select { |t| t['Key'] == "opsworks:layer:#{type}" }.count > 0 rescue false }
-end
-
-def get_address(instance)
-  instance['PublicDnsName'] || instance['PublicIpAddress']
-end
-
-def get_ssh(env, address, cmd=nil)
-  bastion = bastion(env)
-  if ENV['USER']
-    bastion = "#{ENV['USER']}@#{bastion}"
-  end
-
-  base = ['ssh', '-t', bastion]
-  
-  if ENV['IDENTITY']
-    base.concat ['-i', ENV['IDENTITY']]
-  end
-
-  base << '"' + ['ssh', '-t', address, cmd ? "\"#{cmd}\"" : nil].join(' ') + '"'
-  
-  base.join(' ')
-end
-
-def get_internal_address(instance)
-  instance['PrivateIpAddress'] || instance['PrivateDnsName']
-end
-
-def bastion(env)
-  get_address(get_instance(env, 'bastion'))
-end
-
-def run_with_output(env, address, cmd)
-  cmd = get_ssh(env, address, cmd)
-  puts "Running #{get_ssh(env, address, cmd)}"
-
-  Net::SSH.start(address) do |ssh|
-    ssh.exec!("sudo #{cmd}") do |channel, stream, data|
-      STDOUT << data if stream == :stdout
-    end
-  end
-end
+# Main Routine
+puts "\033];Stack\007"
+puts "Welcome to Stacks on Stacks"
 
 if ARGV[0].nil? || ARGV[0] == ""
   puts ""
@@ -202,20 +267,28 @@ if ARGV[0].nil? || ARGV[0] == ""
   puts "\t <serverish>: {env, env:name, env::type, env:ip-address}"
   puts "\t e.g."
   puts "\t stack list <env>"
-  puts "\t stack tail <serverish> [something.log]"
-  puts "\t stack run <serverish> cat /srv/www/shadow/shared/log/staging.log"
+  puts "\t stack tail <serverish> [something.log] (default: /srv/www/<app>/shared/log/<env>.log, if no '/' found in log, defaults to directory /srv/www/<app>/shared/log/)"
+  puts "\t stack run <serverish> cat /srv/www/app/shared/log/production.log"
   puts "\t stack ssh <serverish>"
   puts "\t stack console <serverish>"
+  puts "\t stack configure --key=val --key2=val2"
+  puts "\t"
+  puts "\t config variables: { app: '<app name> for /srv/www/<app>/current directory', profile: 'aws profile in ~/.aws/config', identity: 'e.g. ~/.ssh/id_rsa', ssh_user: 'geoff for ssh geoff@<host>', bastion: 'layer type as a bastion server' }"
   exit
 end
 
-if Stack::Commands.respond_to?(ARGV[0])
-  # TODO: Check method signature and print disparties
-  Stack::Commands.send(ARGV[0], *ARGV[1,])
+
+# TODO: Check method signature and print disparties
+args = ARGV
+args, opts = Stack::Helpers.parse_opts(args)
+Stack::Helpers.load_config!(opts)
+# pp ['Stack',args,opts]
+
+if Stack::Commands.respond_to?(args[0])
+  Stack::Commands.send(args.shift, *args)
   puts "Ending Stacks on Stacks Session"
 else
-  raise "Unknown command: #{ARGV[0]}"
+  raise "Unknown command: #{args[0]}"
 end
 
-puts "Stacks on Stacks Finished"
 puts "\033];bash\007"
