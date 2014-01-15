@@ -8,8 +8,8 @@ Gem::Specification.new do |spec|
   spec.version       = Stacks::On::Stacks::VERSION
   spec.authors       = ["Geoff Hayes"]
   spec.email         = ["hayesgm@gmail.com"]
-  spec.description   = %q{TODO: Write a gem description}
-  spec.summary       = %q{TODO: Write a gem summary}
+  spec.description   = %q{Stacks on Stacks is a management CLI for common tasks on AWS OpsWorks.  You'll be able to SSH to your servers (via a bastion) and send off deploys.}
+  spec.summary       = %q{Stacks on Stack is a CLI for managing an OpsWorks stack}
   spec.homepage      = ""
   spec.license       = "MIT"
 
